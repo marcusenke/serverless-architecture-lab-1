@@ -1,81 +1,91 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using Microsoft.Azure.Documents.Client;
+using CsvHelper;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Extensions.Logging;
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.WindowsAzure.Storage.Blob;
 using TollBooth.Models;
 
 namespace TollBooth
 {
-    internal class DatabaseMethods
+    internal class FileMethods
     {
-        private readonly string _endpointUrl = Environment.GetEnvironmentVariable("cosmosDBEndpointUrl");
-        private readonly string _authorizationKey = Environment.GetEnvironmentVariable("cosmosDBAuthorizationKey");
-        private readonly string _databaseId = Environment.GetEnvironmentVariable("cosmosDBDatabaseId");
-        private readonly string _collectionId = Environment.GetEnvironmentVariable("cosmosDBCollectionId");
+        private readonly CloudBlobClient _blobClient;
+        private readonly string _containerName = Environment.GetEnvironmentVariable("exportCsvContainerName");
+        private readonly string _blobStorageConnection = Environment.GetEnvironmentVariable("dataLakeConnection");
         private readonly ILogger _log;
-        // Reusable instance of DocumentClient which represents the connection to a Cosmos DB endpoint.
-        private DocumentClient _client;
 
-        public DatabaseMethods(ILogger log)
+        public FileMethods(ILogger log)
         {
             _log = log;
+            // Retrieve data lake storage account information from connection string.
+            var storageAccount = CloudStorageAccount.Parse(_blobStorageConnection);
+
+            // Create a blob client for interacting with the data lake account.
+            _blobClient = storageAccount.CreateCloudBlobClient();
         }
 
-        /// <summary>
-        /// Retrieves all license plate records (documents) that have not yet been exported.
-        /// </summary>
-        /// <returns></returns>
-        public List<LicensePlateDataDocument> GetLicensePlatesToExport()
+        public async Task<bool> GenerateAndSaveCsv(IEnumerable<LicensePlateDataDocument> licensePlates)
         {
-            _log.LogInformation("Retrieving license plates to export");
-            int exportedCount = 0;
-            var collectionLink = UriFactory.CreateDocumentCollectionUri(_databaseId, _collectionId);
-            List<LicensePlateDataDocument> licensePlates;
+            var successful = false;
 
-            using (_client = new DocumentClient(new Uri(_endpointUrl), _authorizationKey))
+            _log.LogInformation("Generating CSV file");
+            string blobName = $"{DateTime.UtcNow:s}.csv";
+
+            using (var stream = new MemoryStream())
             {
-                // MaxItemCount value tells the document query to retrieve 100 documents at a time until all are returned.
-                // TODO 5: Retrieve a List of LicensePlateDataDocument objects from the collectionLink where the exported value is false.
-                // COMPLETE: licensePlates = _client.CreateDocumentQuery ...
-                
-                // TODO 6: Remove the line below.
-                licensePlates = new List<LicensePlateDataDocument>();
-            }
-
-            exportedCount = licensePlates.Count();
-            _log.LogInformation($"{exportedCount} license plates found that are ready for export");
-            return licensePlates;
-        }
-
-        /// <summary>
-        /// Updates license plate records (documents) as exported. Call after successfully
-        /// exporting the passed in license plates.
-        /// In a production environment, it would be best to create a stored procedure that
-        /// bulk updates the set of documents, vastly reducing the number of transactions.
-        /// </summary>
-        /// <param name="licensePlates"></param>
-        /// <returns></returns>
-        public async Task MarkLicensePlatesAsExported(IEnumerable<LicensePlateDataDocument> licensePlates)
-        {
-            _log.LogInformation("Updating license plate documents exported values to true");
-            var collectionLink = UriFactory.CreateDocumentCollectionUri(_databaseId, _collectionId);
-
-            using (_client = new DocumentClient(new Uri(_endpointUrl), _authorizationKey))
-            {
-                foreach (var licensePlate in licensePlates)
+                using (var textWriter = new StreamWriter(stream))
+                using (var csv = new CsvWriter(textWriter, CultureInfo.InvariantCulture, false))
                 {
-                    licensePlate.exported = true;
-                    var response = await _client.ReplaceDocumentAsync(UriFactory.CreateDocumentUri(_databaseId, _collectionId, licensePlate.Id), licensePlate);
+                    csv.WriteRecords(licensePlates.Select(ToLicensePlateData));
+                    await textWriter.FlushAsync();
 
-                    var updated = response.Resource;
-                    //_log.Info($"Exported value of updated document: {updated.GetPropertyValue<bool>("exported")}");
+                    _log.LogInformation($"Beginning file upload: {blobName}");
+                    try
+                    {
+                        var container = _blobClient.GetContainerReference(_containerName);
+
+                        // Retrieve reference to a blob.
+                        var blob = container.GetBlockBlobReference(blobName);
+                        await container.CreateIfNotExistsAsync();
+
+                        // Upload blob.
+                        stream.Position = 0;
+                        // TODO 7: Asynchronously upload the blob from the memory stream.
+                        await blob.UploadFromStreamAsync(stream);
+
+                        successful = true;
+                    }
+                    catch (Exception e)
+                    {
+                        _log.LogCritical($"Could not upload CSV file: {e.Message}", e);
+                        successful = false;
+                    }
                 }
             }
+
+            return successful;
         }
 
+        /// <summary>
+        /// Used for mapping from a LicensePlateDataDocument object to a LicensePlateData object.
+        /// </summary>
+        /// <param name="source"></param>
+        /// <returns></returns>
+        private static LicensePlateData ToLicensePlateData(LicensePlateDataDocument source)
+        {
+            return new LicensePlateData
+            {
+                FileName = source.fileName,
+                LicensePlateText = source.licensePlateText,
+                TimeStamp = source.Timestamp
+            };
+        }
     }
 }
